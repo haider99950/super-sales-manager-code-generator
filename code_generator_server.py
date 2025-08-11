@@ -62,7 +62,8 @@ class GeneratorConfig:
     # --- UPDATED: Match the desktop app's code format ---
     GENERATOR_COLLECTION = "license_codes" # This should match the collection name in the desktop app
     CODE_LENGTH = 50
-    CODE_CHARACTERS = string.ascii_letters + string.digits + string.punctuation
+    # FIX: Exclude the forward slash ('/') from the character set to avoid Firestore path errors.
+    CODE_CHARACTERS = string.ascii_letters + string.digits + ''.join(c for c in string.punctuation if c != '/')
 
 # Firebase initialization
 if firestore:
@@ -156,6 +157,7 @@ def generate_code_endpoint():
     # --- UPDATED: Use a loop to handle code collisions, avoiding recursion ---
     while True:
         new_code = generate_random_code()
+        # The fix for the ValueError is in the GeneratorConfig, so no change is needed here.
         doc_ref = db.collection(GeneratorConfig.GENERATOR_COLLECTION).document(new_code)
         doc = doc_ref.get()
 
