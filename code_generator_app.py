@@ -422,6 +422,68 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
             self.clipboard_append(code)
             messagebox.showinfo("Copied", f"Code '{code}' copied to clipboard.")
 
+    # --- FIX: New function to mark a code as used ---
+    def _mark_code_as_used(self, code, machine_id):
+        """
+        Marks a specific license code as used in Firestore.
+        This function should be called by the client application after
+        a successful code validation.
+        """
+        if not self.db_firestore:
+            print("Error: Firebase is not connected, cannot mark code as used.")
+            return False
+
+        try:
+            doc_ref = self.db_firestore.collection('license_codes').document(code)
+            doc_ref.update({
+                'used_globally': True,
+                'used_by_machine_id': machine_id,
+                'used_date': firestore.SERVER_TIMESTAMP
+            })
+            print(f"Code '{code}' successfully marked as used by machine '{machine_id}'.")
+            return True
+        except firebase_exceptions.FirebaseError as fe:
+            print(f"Firebase Error: Failed to mark code as used: {fe}")
+            return False
+        except Exception as e:
+            print(f"Error: Failed to mark code as used: {e}")
+            return False
+
+    # --- EXAMPLE: This is an example of how you would integrate the new function ---
+    def _check_code_and_update_status(self, code_to_check, current_machine_id):
+        """
+        Simulated function that checks a code's validity and marks it as used.
+        In your actual app, this would be the function called when a user enters a code.
+        """
+        if not self.db_firestore:
+            return False
+
+        try:
+            doc_ref = self.db_firestore.collection('license_codes').document(code_to_check)
+            doc = doc_ref.get()
+
+            if not doc.exists:
+                messagebox.showerror("Validation Failed", "The license code you entered is not valid.")
+                return False
+
+            code_data = doc.to_dict()
+            if code_data.get('used_globally', False):
+                messagebox.showwarning("Code Already Used", "This license code has already been used.")
+                return False
+
+            # If the code is valid and unused, mark it as used.
+            # This is where we call the new function to update the status.
+            if self._mark_code_as_used(code_to_check, current_machine_id):
+                messagebox.showinfo("Success", "Your subscription is now active!")
+                return True
+            else:
+                messagebox.showerror("Update Failed", "Could not activate your subscription. Please try again.")
+                return False
+
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred during code validation: {e}")
+            return False
+
     def on_closing(self):
         """Handles graceful application exit by stopping the Firestore listener."""
         if self._firebase_listener_stopper:
