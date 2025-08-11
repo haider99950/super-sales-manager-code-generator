@@ -58,17 +58,18 @@ class GeneratorConfig:
 # Firebase initialization
 if firestore:
     try:
-        # Load the Firebase service account key from the environment variable as a JSON string
-        firebase_service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY")
-        if firebase_service_account_json:
-            service_account_info = json.loads(firebase_service_account_json)
-            cred = credentials.Certificate(service_account_info)
+        # --- FIX: Load Firebase service account key from the secret file path ---
+        # Render mounts secret files at /etc/secrets/<filename>
+        secret_file_path = "/etc/secrets/firebase_service_account.json"
+        if os.path.exists(secret_file_path):
+            cred = credentials.Certificate(secret_file_path)
             firebase_admin.initialize_app(cred)
             db = firestore.client()
             _firebase_initialized = True
-            print("Firebase Admin SDK initialized successfully.")
+            print("Firebase Admin SDK initialized successfully from Secret File.")
         else:
-            print("FIREBASE_SERVICE_ACCOUNT_KEY environment variable not set. Firebase disabled.")
+            print("Firebase service account secret file not found. Firebase disabled.")
+            _firebase_initialized = False
     except Exception as e:
         print(f"Failed to initialize Firebase Admin SDK: {e}")
         _firebase_initialized = False
