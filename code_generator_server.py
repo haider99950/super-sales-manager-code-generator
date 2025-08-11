@@ -1,14 +1,19 @@
 # code_generator_server.py
+#
+# This Flask-based web server listens for requests to automatically
+# generate and store license codes in Firebase Firestore. It now uses the
+# same code generation logic as the desktop app for consistency, and
+# stores the codes in a format that the desktop app's listener can read.
 
 # Import necessary libraries
 import os
-import uuid
 import random
 import string
 import json
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-from flask_cors import CORS # Import Flask-CORS to handle cross-origin requests
+from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor
 
 # Email libraries
@@ -32,12 +37,9 @@ executor = ThreadPoolExecutor(max_workers=5)
 # --- App Initialization and Configuration ---
 app = Flask(__name__)
 
-# --- FIX: Updated CORS Configuration ---
-# The previous CORS config could fail if the MAIN_APP_URL environment variable was not set.
-# This updated version handles that case more robustly.
+# --- CORS Configuration ---
 try:
     main_app_url = os.environ.get("MAIN_APP_URL")
-    # If the environment variable is set, use it. Otherwise, allow all origins for local development.
     origins_list = [main_app_url] if main_app_url else ["*"]
     CORS(app, origins=origins_list)
     print(f"CORS configured to allow requests from: {origins_list}")
@@ -47,23 +49,31 @@ except Exception as e:
 
 # Configuration settings for the code generator server.
 class GeneratorConfig:
+    """
+    Stores configuration settings.
+    CODE_LENGTH and CODE_CHARACTERS must match the desktop app for consistency.
+    """
     SMTP_SERVER = os.environ.get("SMTP_SERVER")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
     SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
     SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
     SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-    GENERATOR_COLLECTION = "generated_codes"
-    CODE_LENGTH = 16
+
+    # --- UPDATED: Match the desktop app's code format ---
+    GENERATOR_COLLECTION = "license_codes" # This should match the collection name in the desktop app
+    CODE_LENGTH = 50
+    CODE_CHARACTERS = string.ascii_letters + string.digits + string.punctuation
 
 # Firebase initialization
 if firestore:
     try:
-        # --- FIX: Load Firebase service account key from the secret file path ---
-        # Render mounts secret files at /etc/secrets/<filename>
+        # Load Firebase service account key from the secret file path
         secret_file_path = "/etc/secrets/firebase_service_account.json"
         if os.path.exists(secret_file_path):
             cred = credentials.Certificate(secret_file_path)
-            firebase_admin.initialize_app(cred)
+            # Check if an app is already initialized to avoid re-initialization
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app(cred)
             db = firestore.client()
             _firebase_initialized = True
             print("Firebase Admin SDK initialized successfully from Secret File.")
@@ -75,12 +85,13 @@ if firestore:
         _firebase_initialized = False
 
 # --- Code Generation and Email Sending Logic ---
-def generate_random_code(length=16, prefix="L"):
-    """Generates a random alphanumeric code."""
-    # Add a unique UUID part and a random string part
-    code_uuid = str(uuid.uuid4()).replace('-', '')
-    code_random = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-    return f"{prefix}-{code_random}-{code_uuid[:8]}".upper()
+def generate_random_code():
+    """
+    Generates a random, complex code that matches the format of the desktop app.
+    This function is a direct copy of the one in the desktop app.
+    """
+    return ''.join(random.choice(GeneratorConfig.CODE_CHARACTERS) for _ in range(GeneratorConfig.CODE_LENGTH))
+
 
 def calculate_expiration_date(license_type):
     """Calculates the expiration date based on license type."""
@@ -93,28 +104,6 @@ def calculate_expiration_date(license_type):
     else:
         # Default to a short trial period if type is unknown
         return datetime.now() + timedelta(days=7)
-
-def store_code_in_firestore(code, email, license_type, expiration_date):
-    """Stores the generated code in Firestore."""
-    if not _firebase_initialized:
-        print("Firestore not initialized, skipping database storage.")
-        return False
-    try:
-        codes_collection_ref = db.collection(GeneratorConfig.GENERATOR_COLLECTION)
-        doc_ref = codes_collection_ref.document() # Let Firestore generate the document ID
-        doc_ref.set({
-            'code': code,
-            'email': email,
-            'license_type': license_type,
-            'expiration_date': expiration_date.isoformat(),
-            'created_at': datetime.now().isoformat(),
-            'status': 'active'
-        })
-        print(f"Code added to Firestore: {code}")
-        return True
-    except Exception as e:
-        print(f"Firebase operation failed: {e}")
-        return False
 
 def send_email_async(to_email, subject, body):
     """Sends an email in a non-blocking way using a thread pool."""
@@ -143,8 +132,6 @@ def _send_email(to_email, subject, body):
         print(f"Failed to send email to {to_email}. Error: {e}")
 
 # --- Flask Routes ---
-# --- FIX: Added a route for the root URL ("/") ---
-# This prevents the 404 Not Found error and is useful for health checks.
 @app.route("/", methods=["GET"])
 def home():
     """A simple route for the root URL."""
@@ -166,13 +153,35 @@ def generate_code_endpoint():
     if not license_type or not user_email:
         return jsonify({"error": "Missing 'license_type' or 'user_email' in request body."}), 400
 
-    # Generate the code and expiration date
+    # --- UPDATED: Use the new code generation logic ---
     new_code = generate_random_code()
     expiration_date = calculate_expiration_date(license_type)
 
-    # Store the new code in Firestore
-    if not store_code_in_firestore(new_code, user_email, license_type, expiration_date):
-         return jsonify({"error": "Failed to add code to Firestore."}), 500
+    try:
+        doc_ref = db.collection(GeneratorConfig.GENERATOR_COLLECTION).document(new_code)
+        doc = doc_ref.get()
+
+        if doc.exists:
+            # Handle collision by trying again
+            print("Warning: Code collision detected. Retrying...")
+            return generate_code_endpoint()
+
+        # Store the new code in Firestore with 'automatic' generation method
+        doc_ref.set({
+            'license_type': license_type,
+            'used_globally': False,
+            'generation_method': 'automatic',
+            'generated_date': firestore.SERVER_TIMESTAMP,
+            'used_by_machine_id': None,
+            'used_date': None,
+            'email': user_email,
+            'expiration_date': expiration_date.isoformat(),
+            'created_at': datetime.now().isoformat(),
+            'status': 'active'
+        })
+    except Exception as e:
+        print(f"Firebase operation failed: {e}")
+        return jsonify({"error": "Failed to add code to Firestore."}), 500
 
     # Send the code via email asynchronously
     subject = "Your Super Sales Manager Code"
@@ -181,7 +190,9 @@ def generate_code_endpoint():
         <body>
             <p>Hello,</p>
             <p>Thank you for subscribing to Super Sales Manager. Your unique code is:</p>
-            <h2 style="color: #4f46e5; font-weight: bold;">{new_code}</h2>
+            <pre style="background-color: #f1f1f1; padding: 10px; border-radius: 5px; overflow-wrap: break-word;">
+                <code style="font-family: monospace; font-size: 14px;">{new_code}</code>
+            </pre>
             <p>This code is used to activate your subscription features in the application.</p>
             <p>Best regards,<br>The Super Sales Manager Team</p>
         </body>

@@ -1,52 +1,34 @@
 # code_generator_app.py
+#
+# This is the refactored, desktop-only version of the Sales Manager Code Generator.
+# It handles manual code generation and provides a real-time view of all license
+# codes (both manual and automatic) stored in Firebase Firestore.
+# The Flask web server functionality has been removed, as it now resides in a
+# separate code_generator_server.py file.
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-import uuid
 import random
 import string
-from datetime import datetime
 import os
-import threading
-import json
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import socketserver
-import time
-from concurrent.futures import ThreadPoolExecutor
-import requests  # Import requests for shutting down the Flask server gracefully
-
-# Flask is used for the web server to handle incoming POST requests.
-try:
-    from flask import Flask, request, jsonify
-
-    _flask_available = True
-except ImportError:
-    _flask_available = False
-    print("Flask not found. Automatic generation via web server will be disabled.")
 
 # Firebase Admin SDK imports
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
     from firebase_admin import exceptions as firebase_exceptions
-
+    # This flag tracks if Firebase has been initialized to prevent re-initialization
     _firebase_initialized = False
 except ImportError:
     messagebox.showerror("Import Error", "Firebase Admin SDK not found. Please install it: pip install firebase-admin")
     _firebase_initialized = False
     firestore = None
 
-# Thread pool for non-blocking operations like sending emails
-executor = ThreadPoolExecutor(max_workers=5)
-
 
 # Configuration
 class GeneratorConfig:
     """
-    Stores configuration settings, color palettes, and other constants for the app.
+    Stores configuration settings and color palettes for the app.
     """
     PRIMARY_BG = "#E3F2FD"
     SECONDARY_BG = "#FFFFFF"
@@ -74,26 +56,18 @@ class GeneratorConfig:
     PAD_X_LARGE = 15
     PAD_Y_LARGE = 15
 
+    # Path to the Firebase service account key file
     FIREBASE_SERVICE_ACCOUNT_KEY_PATH = "firebase_service_account.json"
-    CODE_LENGTH = 64
-    CODE_CHARACTERS = string.ascii_letters + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
 
-    # --- Automatic Generation Settings ---
-    # NOTE: You MUST replace these with your actual email credentials.
-    EMAIL_SENDER = "your_email@example.com"
-    EMAIL_PASSWORD = "your_email_password"
-    SMTP_SERVER = "smtp.example.com"  # e.g., "smtp.gmail.com" for Gmail
-    SMTP_PORT = 587
-
-    WEB_SERVER_HOST = "0.0.0.0"
-    WEB_SERVER_PORT = 5000
+    # --- REVERTED: Configuration for the original raw code format ---
+    CODE_LENGTH = 50
+    CODE_CHARACTERS = string.ascii_letters + string.digits + string.punctuation
 
 
 class SalesManagerCodeGeneratorApp(tk.Tk):
     """
     Main application class for the Sales Manager Code Generator.
-    Allows manual and automatic generation and management of license codes
-    in Firebase Firestore, with separate tabs for each.
+    Manages manual generation and a real-time list of all license codes.
     """
 
     def __init__(self):
@@ -105,8 +79,6 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
 
         self.db_firestore = None
         self._firebase_listener_stopper = None
-        self._web_server_thread = None
-        self.web_server_status_label = None
 
         self._initialize_firebase()
 
@@ -119,9 +91,6 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
         self._setup_ui()
         self._start_firestore_listener()
 
-        if _flask_available:
-            self._start_web_server()
-
         # Create a context menu for copying codes
         self.code_context_menu = tk.Menu(self, tearoff=0)
         self.code_context_menu.add_command(label="Copy Code", command=self._copy_selected_code)
@@ -133,15 +102,17 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
         global _firebase_initialized
         if not _firebase_initialized and firestore:
             try:
+                # Find the service account key file
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 service_account_path = os.path.join(script_dir, GeneratorConfig.FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
 
                 if not os.path.exists(service_account_path):
                     messagebox.showerror("Firebase Error",
                                          f"Firebase service account key not found at: {service_account_path}\n"
-                                         "Please ensure 'firebase_service_account.json' is in the same directory as this script.")
+                                         "Please ensure 'firebase_service_account.json' is in the same directory.")
                     return
 
+                # Initialize the app with the service account credentials
                 cred = credentials.Certificate(service_account_path)
                 if not firebase_admin._apps:
                     firebase_admin.initialize_app(cred)
@@ -223,12 +194,60 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
         # Tab 2: Manual Codes List
         self.manual_codes_tab = ttk.Frame(self.notebook, style="TFrame")
         self.notebook.add(self.manual_codes_tab, text="Manual Codes")
-        self._setup_manual_codes_tab(self.manual_codes_tab)
+        self.manual_codes_tree = self._create_codes_treeview(self.manual_codes_tab, "Manually Generated Codes")
 
         # Tab 3: Automatic Codes List
         self.automatic_codes_tab = ttk.Frame(self.notebook, style="TFrame")
         self.notebook.add(self.automatic_codes_tab, text="Automatic Codes")
-        self._setup_automatic_codes_tab(self.automatic_codes_tab)
+        self.automatic_codes_tree = self._create_codes_treeview(self.automatic_codes_tab, "Automatically Generated Codes")
+
+    def _create_codes_treeview(self, parent_frame, title):
+        """Helper method to create a Treeview for displaying codes, reducing code duplication."""
+        parent_frame.grid_columnconfigure(0, weight=1)
+        parent_frame.grid_rowconfigure(0, weight=0)
+        parent_frame.grid_rowconfigure(1, weight=1)
+
+        ttk.Label(parent_frame, text=title,
+                  font=(GeneratorConfig.FONT_FAMILY, GeneratorConfig.FONT_SIZE_HEADER, 'bold'),
+                  foreground=GeneratorConfig.ACCENT_MAIN, background=GeneratorConfig.SECONDARY_BG).grid(row=0, column=0,
+                                                                                                        pady=(
+                                                                                                            GeneratorConfig.PAD_Y_LARGE,
+                                                                                                            GeneratorConfig.PAD_Y_NORMAL),
+                                                                                                        sticky="ew")
+
+        codes_frame = ttk.LabelFrame(parent_frame, text="License Code Details", style="TFrame",
+                                     padding=(GeneratorConfig.PAD_X_LARGE, GeneratorConfig.PAD_Y_LARGE))
+        codes_frame.grid(row=1, column=0, padx=GeneratorConfig.PAD_X_NORMAL, pady=GeneratorConfig.PAD_Y_NORMAL,
+                         sticky="nsew")
+        codes_frame.grid_rowconfigure(0, weight=1)
+        codes_frame.grid_columnconfigure(0, weight=1)
+
+        tree = ttk.Treeview(codes_frame,
+                            columns=("Code", "Type", "Used Globally", "Used By Machine ID",
+                                     "Generated Date", "Used Date"),
+                            show="headings", style="Treeview")
+        tree.grid(row=0, column=0, sticky="nsew")
+
+        tree.heading("Code", text="Code", anchor="w")
+        tree.heading("Type", text="Type", anchor="center")
+        tree.heading("Used Globally", text="Used Globally", anchor="center")
+        tree.heading("Used By Machine ID", text="Used By Machine ID", anchor="w")
+        tree.heading("Generated Date", text="Generated Date", anchor="center")
+        tree.heading("Used Date", text="Used Date", anchor="center")
+
+        tree.column("Code", width=250, stretch=tk.YES)
+        tree.column("Type", width=80, stretch=tk.NO, anchor="center")
+        tree.column("Used Globally", width=100, stretch=tk.NO, anchor="center")
+        tree.column("Used By Machine ID", width=200, stretch=tk.YES)
+        tree.column("Generated Date", width=150, stretch=tk.NO, anchor="center")
+        tree.column("Used Date", width=150, stretch=tk.NO, anchor="center")
+
+        codes_scrollbar = ttk.Scrollbar(codes_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=codes_scrollbar.set)
+        codes_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        tree.bind("<Button-3>", self._show_code_context_menu)
+        return tree
 
     def _setup_generate_code_tab(self, parent_frame):
         """Sets up the UI for the 'Generate Code' tab."""
@@ -237,7 +256,7 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
         parent_frame.grid_rowconfigure(1, weight=0)
         parent_frame.grid_rowconfigure(2, weight=1)
 
-        ttk.Label(parent_frame, text="Generate New License Code (Manual)",
+        ttk.Label(parent_frame, text="Generate New License Code",
                   font=(GeneratorConfig.FONT_FAMILY, GeneratorConfig.FONT_SIZE_HEADER, 'bold'),
                   foreground=GeneratorConfig.ACCENT_MAIN, background=GeneratorConfig.SECONDARY_BG).grid(row=0, column=0,
                                                                                                         pady=(
@@ -276,164 +295,13 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
                                                                               pady=(GeneratorConfig.PAD_Y_NORMAL,
                                                                                     GeneratorConfig.PAD_Y_SMALL),
                                                                               sticky="w")
+        # Adjusting the width to accommodate the longer code string
         self.generated_code_display = ttk.Entry(control_frame, style="TEntry", state="readonly",
                                                 width=GeneratorConfig.CODE_LENGTH + 10)
         self.generated_code_display.grid(row=2, column=1, columnspan=3, padx=GeneratorConfig.PAD_X_NORMAL,
                                          pady=(GeneratorConfig.PAD_Y_NORMAL, GeneratorConfig.PAD_Y_SMALL), sticky="ew")
 
-        self.web_server_status_label = ttk.Label(control_frame, text="Web Server: Inactive",
-                                                 font=(GeneratorConfig.FONT_FAMILY, GeneratorConfig.FONT_SIZE_NORMAL,
-                                                       'italic'), foreground="red",
-                                                 background=GeneratorConfig.SECONDARY_BG)
-        self.web_server_status_label.grid(row=3, column=0, columnspan=4, pady=(GeneratorConfig.PAD_Y_NORMAL, 0),
-                                          sticky="ew")
-
         parent_frame.grid_rowconfigure(2, weight=1)
-
-    def _setup_manual_codes_tab(self, parent_frame):
-        """Sets up the UI for the 'Manual Codes' tab."""
-        parent_frame.grid_columnconfigure(0, weight=1)
-        parent_frame.grid_rowconfigure(0, weight=0)
-        parent_frame.grid_rowconfigure(1, weight=1)
-
-        ttk.Label(parent_frame, text="Manually Generated Codes",
-                  font=(GeneratorConfig.FONT_FAMILY, GeneratorConfig.FONT_SIZE_HEADER, 'bold'),
-                  foreground=GeneratorConfig.ACCENT_MAIN, background=GeneratorConfig.SECONDARY_BG).grid(row=0, column=0,
-                                                                                                        pady=(
-                                                                                                            GeneratorConfig.PAD_Y_LARGE,
-                                                                                                            GeneratorConfig.PAD_Y_NORMAL),
-                                                                                                        sticky="ew")
-
-        codes_frame = ttk.LabelFrame(parent_frame, text="License Code Details", style="TFrame",
-                                     padding=(GeneratorConfig.PAD_X_LARGE, GeneratorConfig.PAD_Y_LARGE))
-        codes_frame.grid(row=1, column=0, padx=GeneratorConfig.PAD_X_NORMAL, pady=GeneratorConfig.PAD_Y_NORMAL,
-                         sticky="nsew")
-        codes_frame.grid_rowconfigure(0, weight=1)
-        codes_frame.grid_columnconfigure(0, weight=1)
-
-        self.manual_codes_tree = ttk.Treeview(codes_frame,
-                                              columns=("Code", "Type", "Used Globally", "Used By Machine ID",
-                                                       "Generated Date", "Used Date"),
-                                              show="headings", style="Treeview")
-        self.manual_codes_tree.grid(row=0, column=0, sticky="nsew")
-
-        self.manual_codes_tree.heading("Code", text="Code", anchor="w")
-        self.manual_codes_tree.heading("Type", text="Type", anchor="center")
-        self.manual_codes_tree.heading("Used Globally", text="Used Globally", anchor="center")
-        self.manual_codes_tree.heading("Used By Machine ID", text="Used By Machine ID", anchor="w")
-        self.manual_codes_tree.heading("Generated Date", text="Generated Date", anchor="center")
-        self.manual_codes_tree.heading("Used Date", text="Used Date", anchor="center")
-
-        self.manual_codes_tree.column("Code", width=250, stretch=tk.YES)
-        self.manual_codes_tree.column("Type", width=80, stretch=tk.NO, anchor="center")
-        self.manual_codes_tree.column("Used Globally", width=100, stretch=tk.NO, anchor="center")
-        self.manual_codes_tree.column("Used By Machine ID", width=200, stretch=tk.YES)
-        self.manual_codes_tree.column("Generated Date", width=150, stretch=tk.NO, anchor="center")
-        self.manual_codes_tree.column("Used Date", width=150, stretch=tk.NO, anchor="center")
-
-        codes_scrollbar = ttk.Scrollbar(codes_frame, orient="vertical", command=self.manual_codes_tree.yview)
-        self.manual_codes_tree.configure(yscrollcommand=codes_scrollbar.set)
-        codes_scrollbar.grid(row=0, column=1, sticky="ns")
-
-        self.manual_codes_tree.bind("<Button-3>", self._show_code_context_menu)
-
-    def _setup_automatic_codes_tab(self, parent_frame):
-        """Sets up the UI for the 'Automatic Codes' tab."""
-        parent_frame.grid_columnconfigure(0, weight=1)
-        parent_frame.grid_rowconfigure(0, weight=0)
-        parent_frame.grid_rowconfigure(1, weight=1)
-
-        ttk.Label(parent_frame, text="Automatically Generated Codes",
-                  font=(GeneratorConfig.FONT_FAMILY, GeneratorConfig.FONT_SIZE_HEADER, 'bold'),
-                  foreground=GeneratorConfig.ACCENT_MAIN, background=GeneratorConfig.SECONDARY_BG).grid(row=0, column=0,
-                                                                                                        pady=(
-                                                                                                            GeneratorConfig.PAD_Y_LARGE,
-                                                                                                            GeneratorConfig.PAD_Y_NORMAL),
-                                                                                                        sticky="ew")
-
-        codes_frame = ttk.LabelFrame(parent_frame, text="License Code Details", style="TFrame",
-                                     padding=(GeneratorConfig.PAD_X_LARGE, GeneratorConfig.PAD_Y_LARGE))
-        codes_frame.grid(row=1, column=0, padx=GeneratorConfig.PAD_X_NORMAL, pady=GeneratorConfig.PAD_Y_NORMAL,
-                         sticky="nsew")
-        codes_frame.grid_rowconfigure(0, weight=1)
-        codes_frame.grid_columnconfigure(0, weight=1)
-
-        self.automatic_codes_tree = ttk.Treeview(codes_frame,
-                                                 columns=("Code", "Type", "Used Globally", "Used By Machine ID",
-                                                          "Generated Date", "Used Date"),
-                                                 show="headings", style="Treeview")
-        self.automatic_codes_tree.grid(row=0, column=0, sticky="nsew")
-
-        self.automatic_codes_tree.heading("Code", text="Code", anchor="w")
-        self.automatic_codes_tree.heading("Type", text="Type", anchor="center")
-        self.automatic_codes_tree.heading("Used Globally", text="Used Globally", anchor="center")
-        self.automatic_codes_tree.heading("Used By Machine ID", text="Used By Machine ID", anchor="w")
-        self.automatic_codes_tree.heading("Generated Date", text="Generated Date", anchor="center")
-        self.automatic_codes_tree.heading("Used Date", text="Used Date", anchor="center")
-
-        self.automatic_codes_tree.column("Code", width=250, stretch=tk.YES)
-        self.automatic_codes_tree.column("Type", width=80, stretch=tk.NO, anchor="center")
-        self.automatic_codes_tree.column("Used Globally", width=100, stretch=tk.NO, anchor="center")
-        self.automatic_codes_tree.column("Used By Machine ID", width=200, stretch=tk.YES)
-        self.automatic_codes_tree.column("Generated Date", width=150, stretch=tk.NO, anchor="center")
-        self.automatic_codes_tree.column("Used Date", width=150, stretch=tk.NO, anchor="center")
-
-        codes_scrollbar = ttk.Scrollbar(codes_frame, orient="vertical", command=self.automatic_codes_tree.yview)
-        self.automatic_codes_tree.configure(yscrollcommand=codes_scrollbar.set)
-        codes_scrollbar.grid(row=0, column=1, sticky="ns")
-
-        self.automatic_codes_tree.bind("<Button-3>", self._show_code_context_menu)
-
-    def _start_web_server(self):
-        """Initializes and starts the Flask web server in a separate thread."""
-        self.web_server_status_label.config(
-            text=f"Web Server: Running on http://{GeneratorConfig.WEB_SERVER_HOST}:{GeneratorConfig.WEB_SERVER_PORT}",
-            foreground="green")
-
-        self.flask_app = Flask(__name__)
-
-        @self.flask_app.route('/generate_code', methods=['POST'])
-        def generate_code_endpoint():
-            """Endpoint for external services to request a new license code."""
-            try:
-                data = request.get_json()
-                license_type = data.get('license_type')
-                user_email = data.get('user_email')
-
-                if not license_type or not user_email:
-                    return jsonify({"error": "Missing 'license_type' or 'user_email' in request."}), 400
-
-                # Use self.after to schedule the code generation on the main Tkinter thread
-                # This is crucial for thread safety with Tkinter widgets
-                self.after(0, lambda: self._generate_and_add_code_automatic(license_type, user_email))
-
-                return jsonify({"status": "Code generation request received and is being processed."}), 200
-            except Exception as e:
-                return jsonify({"error": str(e)}), 500
-
-        @self.flask_app.route('/shutdown', methods=['POST'])
-        def shutdown_server():
-            """Endpoint to shut down the Flask server gracefully."""
-            func = request.environ.get('werkzeug.server.shutdown')
-            if func is None:
-                raise RuntimeError('Not running with the Werkzeug Server')
-            func()
-            return 'Server shutting down...'
-
-        def run_server():
-            """Wrapper function to run the Flask app and catch potential startup errors."""
-            import logging
-            log = logging.getLogger('werkzeug')
-            log.setLevel(logging.ERROR)
-            try:
-                self.flask_app.run(host=GeneratorConfig.WEB_SERVER_HOST, port=GeneratorConfig.WEB_SERVER_PORT)
-            except Exception as e:
-                # Update the UI on the main thread if the server fails to start
-                self.after(0, lambda: self.web_server_status_label.config(text=f"Web Server: Error - {e}",
-                                                                          foreground="red"))
-
-        self._web_server_thread = threading.Thread(target=run_server, daemon=True)
-        self._web_server_thread.start()
 
     def _start_firestore_listener(self):
         """Starts the real-time listener for license code changes in Firestore."""
@@ -463,26 +331,17 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
             code_data = doc.to_dict()
             code = doc.id
             license_type = code_data.get('license_type', 'N/A')
+            # Check for boolean and convert to "Yes"/"No"
             used_globally = "Yes" if code_data.get('used_globally', False) else "No"
             used_by_machine_id = code_data.get('used_by_machine_id', 'N/A')
             generation_method = code_data.get('generation_method', 'manual')  # Default to manual for legacy codes
 
             # Format timestamps for display
             generated_date_ts = code_data.get('generated_date')
-            if generated_date_ts and hasattr(generated_date_ts, 'strftime'):
-                generated_date = generated_date_ts.strftime("%Y-%m-%d %H:%M:%S")
-            elif generated_date_ts:
-                generated_date = str(generated_date_ts)
-            else:
-                generated_date = 'N/A'
+            generated_date = generated_date_ts.strftime("%Y-%m-%d %H:%M:%S") if generated_date_ts else 'N/A'
 
             used_date_ts = code_data.get('used_date')
-            if used_date_ts and hasattr(used_date_ts, 'strftime'):
-                used_date = used_date_ts.strftime("%Y-%m-%d %H:%M:%S")
-            elif used_date_ts:
-                used_date = str(used_date_ts)
-            else:
-                used_date = 'N/A'
+            used_date = used_date_ts.strftime("%Y-%m-%d %H:%M:%S") if used_date_ts else 'N/A'
 
             if generation_method == 'manual':
                 self.manual_codes_tree.insert("", "end", values=(code, license_type, used_globally, used_by_machine_id,
@@ -502,6 +361,7 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
             messagebox.showerror("Error", "Firebase is not connected.")
             return
 
+        # --- REVERTED: Call the original raw code generator ---
         new_code = self._generate_random_code()
 
         try:
@@ -517,7 +377,7 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
             doc_ref.set({
                 'license_type': license_type,
                 'used_globally': False,
-                'generation_method': 'manual',  # Key addition for separation
+                'generation_method': 'manual',
                 'generated_date': firestore.SERVER_TIMESTAMP,
                 'used_by_machine_id': None,
                 'used_date': None
@@ -532,74 +392,6 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
             messagebox.showerror("Firebase Error", f"Firebase operation failed: {fe}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to add code to Firebase: {e}")
-
-    def _generate_and_add_code_automatic(self, license_type, user_email):
-        """Handles automatic code generation from a web request, adds to Firestore, and sends an email."""
-        if not self.db_firestore:
-            print("Firebase is not connected, cannot fulfill automatic request.")
-            return
-
-        new_code = self._generate_random_code()
-
-        try:
-            doc_ref = self.db_firestore.collection('license_codes').document(new_code)
-            doc_ref.set({
-                'license_type': license_type,
-                'used_globally': False,
-                'generation_method': 'automatic',  # Key addition for separation
-                'generated_date': firestore.SERVER_TIMESTAMP,
-                'used_by_machine_id': None,
-                'used_date': None
-            })
-            print(f"Automatically generated code for {user_email}: {new_code}")
-
-            # Send email in a separate thread to avoid blocking the main UI
-            executor.submit(self._send_email_notification, user_email, new_code, license_type)
-
-            messagebox.showinfo("Automatic Generation",
-                                f"New {license_type} code generated for {user_email} and sent to their email.")
-        except firebase_exceptions.FirebaseError as fe:
-            messagebox.showerror("Firebase Error", f"Automatic generation failed: {fe}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed during automatic generation process: {e}")
-
-    def _send_email_notification(self, to_email, code, license_type):
-        """Sends an email with the newly generated license code."""
-        sender_email = GeneratorConfig.EMAIL_SENDER
-        sender_password = GeneratorConfig.EMAIL_PASSWORD
-
-        if not sender_email or not sender_password:
-            print("Email configuration is incomplete. Cannot send email.")
-            return
-
-        message = MIMEMultipart("alternative")
-        message["Subject"] = "Your New Sales Manager App License Code"
-        message["From"] = sender_email
-        message["To"] = to_email
-
-        html = f"""
-        <html>
-          <body>
-            <p>Hello,</p>
-            <p>Thank you for your purchase! Here is your new <b>{license_type}</b> license code for the Sales Manager App:</p>
-            <h3 style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; text-align: center;">{code}</h3>
-            <p>This code is now active and ready to be used.</p>
-            <p>Regards,<br>Sales Manager App Team</p>
-          </body>
-        </html>
-        """
-        message.attach(MIMEText(html, "html"))
-
-        try:
-            # Use SSL/TLS for secure communication
-            with smtplib.SMTP(GeneratorConfig.SMTP_SERVER, GeneratorConfig.SMTP_PORT) as server:
-                server.starttls()  # Secure the connection
-                server.login(sender_email, sender_password)
-                server.sendmail(sender_email, to_email, message.as_string())
-            print(f"Email successfully sent to {to_email}")
-        except Exception as e:
-            print(f"Failed to send email to {to_email}: {e}")
-            messagebox.showerror("Email Error", f"Failed to send email: {e}")
 
     def _show_code_context_menu(self, event):
         """Displays the right-click context menu for copying codes."""
@@ -631,21 +423,11 @@ class SalesManagerCodeGeneratorApp(tk.Tk):
             messagebox.showinfo("Copied", f"Code '{code}' copied to clipboard.")
 
     def on_closing(self):
-        """Handles graceful application exit, stopping the Firestore listener and web server."""
+        """Handles graceful application exit by stopping the Firestore listener."""
         if self._firebase_listener_stopper:
             self._firebase_listener_stopper.unsubscribe()
             print("Firestore listener stopped.")
 
-        if _flask_available and self._web_server_thread and self._web_server_thread.is_alive():
-            try:
-                # Use a POST request to the shutdown endpoint to stop the Flask server
-                requests.post(f"http://localhost:{GeneratorConfig.WEB_SERVER_PORT}/shutdown")
-                print("Web server shutdown requested.")
-                self._web_server_thread.join(timeout=3)
-            except Exception as e:
-                print(f"Failed to gracefully shut down web server: {e}")
-
-        executor.shutdown(wait=False)
         self.destroy()
 
 
