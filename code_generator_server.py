@@ -94,7 +94,7 @@ def generate_random_code():
 
 
 def calculate_expiration_date(license_type):
-    """Calculates the expiration date based on license type."""
+    """Calculates the expiration date as a datetime object based on license type."""
     if license_type == "monthly":
         # Add 30 days for a monthly plan
         return datetime.now() + timedelta(days=30)
@@ -153,30 +153,27 @@ def generate_code_endpoint():
     if not license_type or not user_email:
         return jsonify({"error": "Missing 'license_type' or 'user_email' in request body."}), 400
 
-    # --- UPDATED: Use the new code generation logic ---
-    new_code = generate_random_code()
-    expiration_date = calculate_expiration_date(license_type)
-
-    try:
+    # --- UPDATED: Use a loop to handle code collisions, avoiding recursion ---
+    while True:
+        new_code = generate_random_code()
         doc_ref = db.collection(GeneratorConfig.GENERATOR_COLLECTION).document(new_code)
         doc = doc_ref.get()
 
-        if doc.exists:
-            # Handle collision by trying again
-            print("Warning: Code collision detected. Retrying...")
-            return generate_code_endpoint()
+        if not doc.exists:
+            break
+        print("Warning: Code collision detected. Retrying...")
 
+    expiration_date = calculate_expiration_date(license_type)
+
+    try:
         # Store the new code in Firestore with 'automatic' generation method
         doc_ref.set({
             'license_type': license_type,
             'used_globally': False,
             'generation_method': 'automatic',
-            'generated_date': firestore.SERVER_TIMESTAMP,
-            'used_by_machine_id': None,
-            'used_date': None,
             'email': user_email,
-            'expiration_date': expiration_date.isoformat(),
-            'created_at': datetime.now().isoformat(),
+            'expiration_date': expiration_date,  # Storing as a native Firestore timestamp
+            'created_at': firestore.SERVER_TIMESTAMP, # Using server timestamp for consistency
             'status': 'active'
         })
     except Exception as e:
