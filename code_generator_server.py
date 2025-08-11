@@ -31,8 +31,19 @@ executor = ThreadPoolExecutor(max_workers=5)
 
 # --- App Initialization and Configuration ---
 app = Flask(__name__)
-# Allow cross-origin requests from your main app's URL
-CORS(app, resources={r"/*": {"origins": os.environ.get("MAIN_APP_URL")}})
+
+# --- FIX: Updated CORS Configuration ---
+# The previous CORS config could fail if the MAIN_APP_URL environment variable was not set.
+# This updated version handles that case more robustly.
+try:
+    main_app_url = os.environ.get("MAIN_APP_URL")
+    # If the environment variable is set, use it. Otherwise, allow all origins for local development.
+    origins_list = [main_app_url] if main_app_url else ["*"]
+    CORS(app, origins=origins_list)
+    print(f"CORS configured to allow requests from: {origins_list}")
+except Exception as e:
+    print(f"Failed to configure CORS: {e}. Falling back to allowing all origins.")
+    CORS(app, origins=["*"])
 
 # Configuration settings for the code generator server.
 class GeneratorConfig:
@@ -131,6 +142,13 @@ def _send_email(to_email, subject, body):
         print(f"Failed to send email to {to_email}. Error: {e}")
 
 # --- Flask Routes ---
+# --- FIX: Added a route for the root URL ("/") ---
+# This prevents the 404 Not Found error and is useful for health checks.
+@app.route("/", methods=["GET"])
+def home():
+    """A simple route for the root URL."""
+    return "Sales Manager Code Generator is running!", 200
+
 @app.route('/generate_code', methods=['POST'])
 def generate_code_endpoint():
     """
