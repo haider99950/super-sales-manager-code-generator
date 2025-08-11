@@ -1,1 +1,1 @@
-web: gunicorn code_generator_server:app
+gunicorn code_generator_server:app
